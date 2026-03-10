@@ -1,6 +1,6 @@
 module github.com/cloudsoda/go-smb2
 
-go 1.20
+go 1.22
 
 require (
 	github.com/geoffgarside/ber v1.1.0
