@@ -6,16 +6,15 @@ import (
 	"crypto/md5"
 	"crypto/rc4"
 	"encoding/hex"
-
 	"testing"
 
-	"github.com/hirochachacha/go-smb2/internal/utf16le"
+	"github.com/antimatter-studios/go-smb2-hirochachacha/internal/utf16le"
 )
 
 func TestNtowfv2(t *testing.T) {
-	USER := utf16le.EncodeStringToBytes("USER")
-	password := utf16le.EncodeStringToBytes("Password")
-	domain := utf16le.EncodeStringToBytes("Domain")
+	USER := utf16le.Encode("USER", utf16le.MapCharsNone)
+	password := utf16le.Encode("Password", utf16le.MapCharsNone)
+	domain := utf16le.Encode("Domain", utf16le.MapCharsNone)
 	ntlmv2Hash, err := hex.DecodeString("0c868a403bfd7a93a3001ef22ef02e3f")
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +196,7 @@ func TestSeal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plainText := utf16le.EncodeStringToBytes("Plaintext")
+	plainText := utf16le.Encode("Plaintext", utf16le.MapCharsNone)
 	ret := make([]byte, len(plainText)+16)
 	clientHandle.XORKeyStream(ret[16:], plainText)
 	mac(ret[:0], NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY|NTLMSSP_NEGOTIATE_KEY_EXCH, clientHandle, clientSignKey, seqNum, plainText)
@@ -212,38 +211,205 @@ func TestSeal(t *testing.T) {
 }
 
 func TestClientServer(t *testing.T) {
-	c := &Client{
-		User:     "user",
-		Password: "password",
+	tests := []struct {
+		name string
+		user string
+		pass string
+	}{
+		{"authenticated", "user", "password"},
+		{"anonymous", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{
+				User:     tt.user,
+				Password: tt.pass,
+			}
+
+			s := NewServer("server")
+			if tt.user != "" {
+				s.AddAccount("user", "password")
+			}
+
+			nmsg, err := c.Negotiate()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cmsg, err := s.Challenge(nmsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			amsg, err := c.Authenticate(cmsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = s.Authenticate(amsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Session() == nil {
+				t.Error("error")
+			}
+			if s.Session() == nil {
+				t.Error("error")
+			}
+		})
+	}
+}
+
+// domainOf reads the DomainName field out of an AUTHENTICATE message.
+// Layout: 28-30 length, 30-32 max length, 32-36 buffer offset.
+func domainOf(t *testing.T, amsg []byte) string {
+	t.Helper()
+	if len(amsg) < 36 {
+		t.Fatalf("authenticate message is %d bytes, too short to hold a domain field", len(amsg))
+	}
+	length := int(le.Uint16(amsg[28:30]))
+	offset := int(le.Uint32(amsg[32:36]))
+	if length == 0 {
+		return ""
+	}
+	if offset+length > len(amsg) {
+		t.Fatalf("domain field runs past the message: offset %d length %d in %d bytes", offset, length, len(amsg))
+	}
+	return utf16le.Decode(amsg[offset:offset+length], utf16le.MapCharsNone)
+}
+
+// An empty Domain cannot be told apart from one that was never set, so it
+// falls back to the domain the server named. SendEmptyDomain asks for the
+// empty domain that some servers require and that smbclient sends.
+func TestClientSendEmptyDomain(t *testing.T) {
+	tests := []struct {
+		name            string
+		domain          string
+		sendEmptyDomain bool
+		want            string
+	}{
+		{"unset domain falls back to the server's", "", false, "server"},
+		{"an explicit domain is sent as given", "WORKGROUP", false, "WORKGROUP"},
+		{"SendEmptyDomain sends none", "", true, ""},
+		{"SendEmptyDomain does not override an explicit domain", "WORKGROUP", true, "WORKGROUP"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{
+				User:            "user",
+				Password:        "password",
+				Domain:          tt.domain,
+				SendEmptyDomain: tt.sendEmptyDomain,
+			}
+
+			s := NewServer("server")
+			s.AddAccount("user", "password")
+
+			nmsg, err := c.Negotiate()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmsg, err := s.Challenge(nmsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			amsg, err := c.Authenticate(cmsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := domainOf(t, amsg); got != tt.want {
+				t.Errorf("domain sent: %q, want %q", got, tt.want)
+			}
+
+			if err := s.Authenticate(amsg); err != nil {
+				t.Errorf("server rejected the authentication: %v", err)
+			}
+		})
+	}
+}
+
+// buildChallenge assembles a CHALLENGE message with the given flags, target
+// name and target info, so a server that omits either can be reproduced
+// without one.
+func buildChallenge(flags uint32, targetName, targetInfo []byte) []byte {
+	const headerLen = 56
+
+	cmsg := make([]byte, headerLen+len(targetName)+len(targetInfo))
+	copy(cmsg[:8], signature)
+	le.PutUint32(cmsg[8:12], NtLmChallenge)
+
+	off := headerLen
+
+	le.PutUint16(cmsg[12:14], uint16(len(targetName)))
+	le.PutUint16(cmsg[14:16], uint16(len(targetName)))
+	le.PutUint32(cmsg[16:20], uint32(off))
+	copy(cmsg[off:], targetName)
+	off += len(targetName)
+
+	le.PutUint32(cmsg[20:24], flags)
+
+	// 24-32 ServerChallenge, left zero: nothing here depends on its value.
+
+	le.PutUint16(cmsg[40:42], uint16(len(targetInfo)))
+	le.PutUint16(cmsg[42:44], uint16(len(targetInfo)))
+	le.PutUint32(cmsg[44:48], uint32(off))
+	copy(cmsg[off:], targetInfo)
+
+	return cmsg
+}
+
+// A server grants NTLMSSP_REQUEST_TARGET and NTLMSSP_NEGOTIATE_TARGET_INFO, or
+// does not. Refusing the ones that do not is what hirochachacha#49 reports,
+// against NAS and embedded servers that authenticate perfectly well.
+func TestChallengeWithoutOptionalFlags(t *testing.T) {
+	// A minimal AV pair list: NetBIOS domain name, then MsvAvEOL.
+	targetInfo := []byte{
+		0x02, 0x00, 0x0c, 0x00, // MsvAvNbDomainName, length 12
+		0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, 0x69, 0x00, 0x6e, 0x00, // "Domain"
+		0x00, 0x00, 0x00, 0x00, // MsvAvEOL
+	}
+	targetName := utf16le.Encode("SERVER", utf16le.MapCharsNone)
+
+	base := uint32(NTLMSSP_NEGOTIATE_UNICODE | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY)
+
+	tests := []struct {
+		name  string
+		flags uint32
+	}{
+		{"both granted", base | NTLMSSP_REQUEST_TARGET | NTLMSSP_NEGOTIATE_TARGET_INFO},
+		{"no target info", base | NTLMSSP_REQUEST_TARGET},
+		{"no request target", base | NTLMSSP_NEGOTIATE_TARGET_INFO},
+		{"neither", base},
 	}
 
-	s := NewServer("server")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{User: "user", Password: "password"}
 
-	s.AddAccount("user", "password")
+			nmsg, err := c.Negotiate()
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	nmsg, err := c.Negotiate()
-	if err != nil {
-		t.Fatal(err)
-	}
+			cmsg := buildChallenge(tt.flags, targetName, targetInfo)
 
-	cmsg, err := s.Challenge(nmsg)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	amsg, err := c.Authenticate(cmsg)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = s.Authenticate(amsg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Session() == nil {
-		t.Error("error")
-	}
-	if s.Session() == nil {
-		t.Error("error")
+			amsg, err := c.Authenticate(cmsg)
+			if err != nil {
+				t.Fatalf("authenticate: %v", err)
+			}
+			if len(nmsg) == 0 {
+				t.Fatal("empty negotiate message")
+			}
+			if len(amsg) < 12 {
+				t.Fatalf("authenticate message is %d bytes", len(amsg))
+			}
+			if !bytes.Equal(amsg[:8], signature) {
+				t.Error("authenticate message does not carry the NTLM signature")
+			}
+			if got := le.Uint32(amsg[8:12]); got != NtLmAuthenticate {
+				t.Errorf("message type %d, want %d", got, NtLmAuthenticate)
+			}
+		})
 	}
 }
